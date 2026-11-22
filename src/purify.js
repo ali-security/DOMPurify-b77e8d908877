@@ -118,6 +118,10 @@ function createDOMPurify(window = getGlobal()) {
     Node && Node.prototype ? lookupGetter(Node.prototype, 'nodeType') : null;
   const getNodeName =
     Node && Node.prototype ? lookupGetter(Node.prototype, 'nodeName') : null;
+  const getShadowRoot =
+    'shadowRoot' in ElementPrototype
+      ? lookupGetter(ElementPrototype, 'shadowRoot')
+      : null;
 
   // As per issue #47, the web-components registry is inherited by a
   // new document created via createHTMLDocument. As per the spec
@@ -1656,10 +1660,93 @@ function createDOMPurify(window = getGlobal()) {
       if (_isDocumentFragment(shadowNode.content)) {
         _sanitizeShadowDOM(shadowNode.content);
       }
+
+      /* An element iterated here may itself host an attached
+         shadow root. The default NodeIterator does not enter shadow
+         trees, so a shadow root nested inside template.content was
+         previously reached by no walk at all (the template-content
+         recursion above iterates the content but never inspected
+         shadowRoot). Walk it explicitly; the recursion also covers
+         shadow roots and templates nested deeper inside it. The
+         nodeType guard avoids reading shadowRoot off text / comment /
+         CDATA / PI nodes that the iterator also surfaces. */
+      const shadowNodeType = getNodeType
+        ? getNodeType(shadowNode)
+        : shadowNode.nodeType;
+      if (shadowNodeType === 1) {
+        const innerSr = getShadowRoot
+          ? getShadowRoot(shadowNode)
+          : shadowNode.shadowRoot;
+        if (_isDocumentFragment(innerSr)) {
+          _sanitizeAttachedShadowRoots(innerSr);
+          _sanitizeShadowDOM(innerSr);
+        }
+      }
+    }
+
+    /* The per-node strip in _sanitizeElements sees each text node alone, so
+       an expression split across text nodes by a removed element survives
+       inside a shadow tree or template content: NodeIterator does not enter
+       them and normalize() on the light DOM does not merge across that
+       boundary. Merge and re-scrub this fragment before the hook sees it
+       (upstream fdfd5a3f). */
+    if (SAFE_FOR_TEMPLATES) {
+      _scrubTemplateExpressions(fragment, true);
     }
 
     /* Execute a hook if present */
     _executeHook('afterSanitizeShadowDOM', fragment, null);
+  };
+
+  /**
+   * _sanitizeAttachedShadowRoots
+   *
+   * Walks `root` and feeds every attached shadow root it finds into
+   * _sanitizeShadowDOM. The node iterator does not descend into shadow
+   * trees, so an open shadow root attached to the IN_PLACE root or to any
+   * element below it (or deep-cloned by importNode() for a clonable shadow
+   * root) would otherwise never be sanitized. Runs once, before the main
+   * walk. Children are snapshotted first, as a hook may detach siblings.
+   * All reads go through the cached prototype getters, so a clobbering form
+   * descendant can not steer the walk.
+   *
+   * @param  {Node} root the subtree root to walk for attached shadow roots
+   */
+  const _sanitizeAttachedShadowRoots = function (root) {
+    if (!getShadowRoot) {
+      return;
+    }
+
+    const nodeType = getNodeType ? getNodeType(root) : root.nodeType;
+    if (nodeType === 1) {
+      const shadowRoot = getShadowRoot(root);
+      if (_isDocumentFragment(shadowRoot)) {
+        /* Recurse first so that nested shadow roots are reached even if
+           _sanitizeShadowDOM removes hosts at this level */
+        _sanitizeAttachedShadowRoots(shadowRoot);
+        _sanitizeShadowDOM(shadowRoot);
+      }
+    } else if (nodeType !== 9 && nodeType !== 11) {
+      return;
+    }
+
+    const childNodes = getChildNodes(root);
+    if (!childNodes) {
+      return;
+    }
+
+    const snapshot = [];
+    arrayForEach(childNodes, (child) => {
+      arrayPush(snapshot, child);
+    });
+    arrayForEach(snapshot, (child) => {
+      _sanitizeAttachedShadowRoots(child);
+    });
+
+    /* A <template> keeps its children in .content */
+    if (nodeType === 1 && _isDocumentFragment(root.content)) {
+      _sanitizeAttachedShadowRoots(root.content);
+    }
   };
 
   /**
@@ -1817,6 +1904,14 @@ function createDOMPurify(window = getGlobal()) {
     /* Remove first element node (ours) if FORCE_BODY is set */
     if (body && FORCE_BODY) {
       _forceRemove(body.firstChild);
+    }
+
+    /* Sanitize attached shadow roots before the main walk, which does not
+       enter shadow trees. */
+    if (IN_PLACE) {
+      _sanitizeAttachedShadowRoots(dirty);
+    } else if (importedNode) {
+      _sanitizeAttachedShadowRoots(importedNode);
     }
 
     /* Get node iterator */
